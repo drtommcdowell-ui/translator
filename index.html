@@ -326,3 +326,25 @@ $('startBtn').onclick = async function(){
     btn.textContent = 'Stop'; btn.classList.add('stop');
     setStatus('Listening.');
   } else {
+    running = false; stopRecorderSilently();
+    if (currentSource) { try { currentSource.stop(); } catch(e) {} currentSource = null; }
+    playing = false; closeMic();
+    if (wakeLock) { try { await wakeLock.release(); } catch(e) {} wakeLock = null; }
+    turns = []; renderCaptions();
+    btn.textContent = 'Start'; btn.classList.remove('stop');
+    setStatus('Stopped.');
+  }
+};
+
+$('listMics').onclick = async function(){
+  try {
+    var tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+    var inputs = await listInputs(); tmp.getTracks().forEach(function(t){ t.stop(); });
+    $('diag').textContent = inputs.map(function(d, i){ return (i + 1) + '. ' + (d.label || '(no name)') + '  [' + d.deviceId.slice(0, 8) + ']'; }).join('\n') || 'No microphones found.';
+  } catch(e) { $('diag').textContent = 'Error: ' + e.message; }
+};
+
+paintChoices(); showKeyState();
+</script>
+</body>
+</html>
