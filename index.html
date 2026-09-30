@@ -5,92 +5,163 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Translator</title>
 <style>
-body{font-family:sans-serif;margin:16px;font-size:20px;background:#fff;color:#111}
-button{font-size:22px;padding:14px 18px;margin:8px 0;width:100%;border-radius:10px;border:0;background:#1a73e8;color:#fff}
-input,textarea{font-size:20px;padding:10px;width:100%;box-sizing:border-box}
-#out{margin-top:16px;padding:12px;border:1px solid #ccc;border-radius:10px;min-height:60px;white-space:pre-wrap}
+body{font-family:sans-serif;margin:12px;font-size:20px;background:#fff;color:#111}
+h1{margin:4px 0 8px;font-size:28px}
+button{font-size:20px;padding:12px;border-radius:10px;border:0;background:#1a73e8;color:#fff}
+.big{width:100%;font-size:32px;padding:22px;margin:8px 0}
+.stop{background:#c62828}
+.row{display:flex;gap:8px;margin:8px 0}
+.row button{flex:1;background:#e0e0e0;color:#111}
+.row button.on{background:#1a73e8;color:#fff}
+.small{font-size:16px;color:#555}
+#meter{height:14px;background:#eee;border-radius:7px;overflow:hidden;margin:6px 0}
+#bar{height:100%;width:0;background:#2e7d32}
+#captions{border:1px solid #ccc;border-radius:10px;min-height:120px;padding:10px;margin:8px 0;white-space:pre-wrap}
+#diag{font-size:14px;white-space:pre-wrap;background:#f5f5f5;padding:8px;border-radius:8px}
 .hide{display:none}
+input{font-size:18px;padding:8px;width:100%;box-sizing:border-box}
+details{margin-top:14px}
 </style>
 </head>
 <body>
 <h1>Translator</h1>
-<p>Setup test (file 1)</p>
+<div id="status" class="small">Ready. Press Start.</div>
+<button id="startBtn" class="big">Start</button>
+<div id="meter"><div id="bar"></div></div>
+<div class="small" id="micName">Mic: not started</div>
 
-<div id="keyBox">
-<p>Paste your Gemini API key:</p>
-<input id="keyInput" type="password" autocomplete="off">
-<button id="saveKey">Save key</button>
-</div>
+<div class="small">Microphone</div>
+<div class="row"><button id="micEarbud">Earbud mic</button><button id="micPhone">Phone mic</button></div>
+<div class="small">Partner</div>
+<div class="row"><button id="pFemale">Female</button><button id="pMale">Male</button></div>
 
-<div id="keySaved" class="hide">
-<p>Key saved on this device.</p>
-<button id="changeKey" style="background:#777">Change key</button>
-</div>
+<div id="captions">Captions will appear here.</div>
 
-<p>English sentence to test:</p>
-<textarea id="testText" rows="2">Good morning, did you sleep well?</textarea>
-<button id="testBtn">Test translation</button>
-<div id="out"></div>
+<details><summary>Ear test</summary>
+<p class="small">Left earbud = partner (Thai). Right earbud = you (English).</p>
+<div class="row"><button id="testLeft" class="on">Beep LEFT</button><button id="testRight" class="on">Beep RIGHT</button></div>
+</details>
+
+<details><summary>Microphone list</summary>
+<button id="listMics">Show microphones</button>
+<div id="diag"></div>
+</details>
+
+<details><summary>API key</summary>
+<div id="keyBox"><p class="small">Paste your Gemini API key:</p><input id="keyInput" type="password" autocomplete="off"><button id="saveKey" style="margin-top:8px">Save key</button></div>
+<div id="keySaved" class="hide"><p class="small">Key saved on this device.</p><button id="changeKey" style="background:#777">Change key</button></div>
+</details>
+<p class="small">Version: file 2</p>
 
 <script>
-var RULES = "You are a live interpreter. Tom is a man who speaks English. Translate each English message from Tom into natural, friendly, polite everyday Central Thai.\n\nRules:\n1. Tom is male. Always use male forms: ผม for I/me, and end each reply with ครับ or นะครับ. Never use ฉัน, ดิฉัน, ค่ะ, คะ or นะคะ.\n2. This applies even when Tom talks about or quotes a woman. Tom is still the speaker, so the reply still ends with ครับ.\n3. Friendly and polite everyday Thai. No slang, no crude words, no royal or official vocabulary.\n4. Translate questions and requests. Never answer them and never add anything.\n5. Output only the Thai translation: no English, no romanization, no notes, no quotation marks.\n6. Keep names, numbers and places exactly as said.";
+var $ = function(id){ return document.getElementById(id); };
+function load(k,d){ try { var v = localStorage.getItem(k); return v === null ? d : v; } catch(e) { return d; } }
+function save(k,v){ try { localStorage.setItem(k,v); } catch(e) {} }
+var S = { mic: load('micChoice','phone'), partner: load('partner','female') };
 
-function getKey(){ try { return localStorage.getItem('geminiKey') || ''; } catch(e) { return ''; } }
-
-function showKeyState(){
-  var k = getKey();
-  document.getElementById('keyBox').classList.toggle('hide', !!k);
-  document.getElementById('keySaved').classList.toggle('hide', !k);
+function paintChoices(){
+  $('micEarbud').classList.toggle('on', S.mic === 'earbud');
+  $('micPhone').classList.toggle('on', S.mic === 'phone');
+  $('pFemale').classList.toggle('on', S.partner === 'female');
+  $('pMale').classList.toggle('on', S.partner === 'male');
 }
+$('micEarbud').onclick = function(){ S.mic = 'earbud'; save('micChoice','earbud'); paintChoices(); if (running) restartMic(); };
+$('micPhone').onclick = function(){ S.mic = 'phone'; save('micChoice','phone'); paintChoices(); if (running) restartMic(); };
+$('pFemale').onclick = function(){ S.partner = 'female'; save('partner','female'); paintChoices(); };
+$('pMale').onclick = function(){ S.partner = 'male'; save('partner','male'); paintChoices(); };
 
-document.getElementById('saveKey').onclick = function(){
-  var v = document.getElementById('keyInput').value.trim();
-  if (!v) { alert('Paste the key first.'); return; }
-  try { localStorage.setItem('geminiKey', v); } catch(e) { alert('Could not save the key: ' + e.message); return; }
-  document.getElementById('keyInput').value = '';
-  showKeyState();
-};
+function getKey(){ return load('geminiKey',''); }
+function showKeyState(){ var k = getKey(); $('keyBox').classList.toggle('hide', !!k); $('keySaved').classList.toggle('hide', !k); }
+$('saveKey').onclick = function(){ var v = $('keyInput').value.trim(); if (!v) { alert('Paste the key first.'); return; } save('geminiKey', v); $('keyInput').value = ''; showKeyState(); };
+$('changeKey').onclick = function(){ try { localStorage.removeItem('geminiKey'); } catch(e) {} showKeyState(); };
 
-document.getElementById('changeKey').onclick = function(){
-  try { localStorage.removeItem('geminiKey'); } catch(e) {}
-  showKeyState();
-};
-
-function extractText(j){
-  if (j && typeof j.output_text === 'string') return j.output_text;
-  var parts = [];
-  ((j && j.steps) || []).forEach(function(s){
-    (s.content || []).forEach(function(c){ if (c.type === 'text' && c.text) parts.push(c.text); });
-  });
-  return parts.join('\n');
+var ctx = null;
+function ensureCtx(){ if (!ctx) { ctx = new (window.AudioContext || window.webkitAudioContext)(); } if (ctx.state === 'suspended') { ctx.resume(); } return ctx; }
+function beep(pan){
+  var c = ensureCtx(); var t = c.currentTime + 0.05;
+  var o = c.createOscillator(); var g = c.createGain(); var p = c.createStereoPanner();
+  p.pan.value = pan; o.frequency.value = pan < 0 ? 440 : 880;
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.4, t + 0.05);
+  g.gain.setValueAtTime(0.4, t + 0.6); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.8);
+  o.connect(g); g.connect(p); p.connect(c.destination); o.start(t); o.stop(t + 0.85);
 }
+$('testLeft').onclick = function(){ beep(-1); };
+$('testRight').onclick = function(){ beep(1); };
 
-document.getElementById('testBtn').onclick = async function(){
-  var out = document.getElementById('out');
-  var key = getKey();
-  if (!key) { out.textContent = 'No key saved yet.'; return; }
-  out.textContent = 'Working...';
-  try {
-    var r = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-      body: JSON.stringify({
-        model: 'gemini-3.5-flash-lite',
-        system_instruction: RULES,
-        input: document.getElementById('testText').value
-      })
-    });
-    var t = await r.text();
-    var j = null; try { j = JSON.parse(t); } catch(e) {}
-    if (!r.ok) { out.textContent = 'ERROR ' + r.status + '\n' + t.slice(0, 800); return; }
-    var txt = extractText(j);
-    out.textContent = txt ? ('OK\n' + txt) : ('No text found. Raw reply:\n' + t.slice(0, 800));
-  } catch(e) {
-    out.textContent = 'ERROR (network): ' + e.message;
+var running = false, stream = null, raf = 0, analyser = null, srcNode = null, wakeLock = null;
+async function listInputs(){
+  var devs = await navigator.mediaDevices.enumerateDevices();
+  return devs.filter(function(d){ return d.kind === 'audioinput'; });
+}
+function pickDevice(inputs){
+  var bt = /bluetooth|headset|hands|hfp|sco|xg99|\bbt\b/i;
+  if (S.mic === 'earbud') { return inputs.find(function(d){ return bt.test(d.label); }) || null; }
+  return inputs.find(function(d){ return !bt.test(d.label) && d.deviceId !== 'default' && d.deviceId !== 'communications'; }) || null;
+}
+async function openMic(){
+  var tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+  var inputs = await listInputs();
+  tmp.getTracks().forEach(function(t){ t.stop(); });
+  var dev = pickDevice(inputs);
+  var note = (S.mic === 'earbud' && !dev) ? ' (earbud mic not found, using default)' : '';
+  var a = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+  if (dev) { a.deviceId = { exact: dev.deviceId }; }
+  stream = await navigator.mediaDevices.getUserMedia({ audio: a });
+  var c = ensureCtx();
+  srcNode = c.createMediaStreamSource(stream);
+  analyser = c.createAnalyser(); analyser.fftSize = 1024;
+  srcNode.connect(analyser);
+  $('micName').textContent = 'Mic: ' + (stream.getAudioTracks()[0].label || 'unnamed') + note;
+  meterLoop();
+}
+function closeMic(){
+  cancelAnimationFrame(raf); raf = 0;
+  if (srcNode) { try { srcNode.disconnect(); } catch(e) {} srcNode = null; }
+  if (stream) { stream.getTracks().forEach(function(t){ t.stop(); }); stream = null; }
+  $('bar').style.width = '0';
+}
+async function restartMic(){ closeMic(); try { await openMic(); } catch(e) { $('status').textContent = 'Mic error: ' + e.message; } }
+function meterLoop(){
+  var buf = new Float32Array(analyser.fftSize);
+  (function tick(){
+    analyser.getFloatTimeDomainData(buf);
+    var s = 0; for (var i = 0; i < buf.length; i++) { s += buf[i] * buf[i]; }
+    var rms = Math.sqrt(s / buf.length);
+    $('bar').style.width = Math.min(100, Math.round(rms * 400)) + '%';
+    raf = requestAnimationFrame(tick);
+  })();
+}
+async function lockScreen(){
+  try { if ('wakeLock' in navigator) { wakeLock = await navigator.wakeLock.request('screen'); } }
+  catch(e) { $('status').textContent = 'Screen-awake not available: ' + e.message; }
+}
+document.addEventListener('visibilitychange', function(){ if (running && document.visibilityState === 'visible') { lockScreen(); } });
+
+$('startBtn').onclick = async function(){
+  var btn = this;
+  if (!running) {
+    ensureCtx();
+    try { await openMic(); } catch(e) { $('status').textContent = 'Mic error: ' + e.message; return; }
+    await lockScreen();
+    running = true; btn.textContent = 'Stop'; btn.classList.add('stop');
+    $('status').textContent = 'Listening. Talk and watch the green bar.';
+  } else {
+    running = false; closeMic();
+    if (wakeLock) { try { await wakeLock.release(); } catch(e) {} wakeLock = null; }
+    btn.textContent = 'Start'; btn.classList.remove('stop');
+    $('status').textContent = 'Stopped.';
   }
 };
 
-showKeyState();
+$('listMics').onclick = async function(){
+  try {
+    var tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+    var inputs = await listInputs(); tmp.getTracks().forEach(function(t){ t.stop(); });
+    $('diag').textContent = inputs.map(function(d, i){ return (i + 1) + '. ' + (d.label || '(no name)') + '  [' + d.deviceId.slice(0, 8) + ']'; }).join('\n') || 'No microphones found.';
+  } catch(e) { $('diag').textContent = 'Error: ' + e.message; }
+};
+
+paintChoices(); showKeyState();
 </script>
 </body>
 </html>
