@@ -14,9 +14,10 @@ button{font-size:20px;padding:12px;border-radius:10px;border:0;background:#1a73e
 .row button{flex:1;background:#e0e0e0;color:#111}
 .row button.on{background:#1a73e8;color:#fff}
 .small{font-size:16px;color:#555}
+#status{font-size:18px;color:#1a237e;font-weight:bold}
 #meter{height:14px;background:#eee;border-radius:7px;overflow:hidden;margin:6px 0}
 #bar{height:100%;width:0;background:#2e7d32}
-#captions{border:1px solid #ccc;border-radius:10px;min-height:120px;padding:10px;margin:8px 0;white-space:pre-wrap}
+#captions{border:1px solid #ccc;border-radius:10px;min-height:160px;padding:10px;margin:8px 0;white-space:pre-wrap;font-size:22px}
 #diag{font-size:14px;white-space:pre-wrap;background:#f5f5f5;padding:8px;border-radius:8px}
 .hide{display:none}
 input{font-size:18px;padding:8px;width:100%;box-sizing:border-box}
@@ -25,7 +26,7 @@ details{margin-top:14px}
 </head>
 <body>
 <h1>Translator</h1>
-<div id="status" class="small">Ready. Press Start.</div>
+<div id="status">Ready. Press Start.</div>
 <button id="startBtn" class="big">Start</button>
 <div id="meter"><div id="bar"></div></div>
 <div class="small" id="micName">Mic: not started</div>
@@ -51,13 +52,19 @@ details{margin-top:14px}
 <div id="keyBox"><p class="small">Paste your Gemini API key:</p><input id="keyInput" type="password" autocomplete="off"><button id="saveKey" style="margin-top:8px">Save key</button></div>
 <div id="keySaved" class="hide"><p class="small">Key saved on this device.</p><button id="changeKey" style="background:#777">Change key</button></div>
 </details>
-<p class="small">Version: file 2</p>
+<p class="small">Version: file 3</p>
 
 <script>
 var $ = function(id){ return document.getElementById(id); };
 function load(k,d){ try { var v = localStorage.getItem(k); return v === null ? d : v; } catch(e) { return d; } }
 function save(k,v){ try { localStorage.setItem(k,v); } catch(e) {} }
+function setStatus(t){ $('status').textContent = t; }
 var S = { mic: load('micChoice','phone'), partner: load('partner','female') };
+
+var RULES_TH = "You are a live interpreter. Tom is a man who speaks English. Translate each English message from Tom into natural, friendly, polite everyday Central Thai.\n\nRules:\n1. Tom is male. Always use male forms: ผม for I/me, and end each reply with ครับ or นะครับ. Never use ฉัน, ดิฉัน, ค่ะ, คะ or นะคะ.\n2. This applies even when Tom talks about or quotes a woman. Tom is still the speaker, so the reply still ends with ครับ.\n3. Friendly and polite everyday Thai. No slang, no crude words, no royal or official vocabulary.\n4. Translate questions and requests. Never answer them and never add anything.\n5. Output only the Thai translation: no English, no romanization, no notes, no quotation marks.\n6. Keep names, numbers and places exactly as said.";
+var RULES_EN = "You are a live interpreter. Tom's conversation partner speaks Central Thai to Tom. Translate each Thai message into natural, friendly, polite everyday English.\n\nRules:\n1. Translate questions and requests. Never answer them and never add anything.\n2. Output only the English translation: no Thai, no notes, no quotation marks.\n3. Keep names, numbers and places exactly as said.";
+var API_URL = 'https://generativelanguage.googleapis.com/v1beta/interactions';
+var PAUSE_MS = 4000, TH = 0.02;
 
 function paintChoices(){
   $('micEarbud').classList.toggle('on', S.mic === 'earbud');
@@ -89,6 +96,9 @@ $('testLeft').onclick = function(){ beep(-1); };
 $('testRight').onclick = function(){ beep(1); };
 
 var running = false, stream = null, raf = 0, analyser = null, srcNode = null, wakeLock = null;
+var rec = null, heardSpeech = false, voicedFrames = 0, lastVoice = 0, segStart = 0;
+var queue = Promise.resolve(), turns = [];
+
 async function listInputs(){
   var devs = await navigator.mediaDevices.enumerateDevices();
   return devs.filter(function(d){ return d.kind === 'audioinput'; });
@@ -120,7 +130,33 @@ function closeMic(){
   if (stream) { stream.getTracks().forEach(function(t){ t.stop(); }); stream = null; }
   $('bar').style.width = '0';
 }
-async function restartMic(){ closeMic(); try { await openMic(); } catch(e) { $('status').textContent = 'Mic error: ' + e.message; } }
+function stopRecorderSilently(){ if (rec) { var r = rec; rec = null; r.onstop = null; try { r.stop(); } catch(e) {} } }
+async function restartMic(){
+  stopRecorderSilently(); closeMic();
+  try { await openMic(); if (running) startRecorder(); } catch(e) { setStatus('Mic error: ' + e.message); }
+}
+
+function startRecorder(){
+  var mt = (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) ? 'audio/webm;codecs=opus' : '';
+  var r = mt ? new MediaRecorder(stream, { mimeType: mt }) : new MediaRecorder(stream);
+  r._chunks = [];
+  r.ondataavailable = function(e){ if (e.data && e.data.size) r._chunks.push(e.data); };
+  r.start();
+  rec = r; heardSpeech = false; voicedFrames = 0; segStart = Date.now(); lastVoice = 0;
+}
+function endSegment(send){
+  var r = rec; if (!r) return; rec = null;
+  var had = heardSpeech && voicedFrames >= 10;
+  r.onstop = function(){
+    if (send && had) {
+      var type = (r.mimeType || 'audio/webm').split(';')[0];
+      enqueue(new Blob(r._chunks, { type: type }), type);
+    }
+  };
+  try { r.stop(); } catch(e) {}
+  if (running) startRecorder();
+}
+
 function meterLoop(){
   var buf = new Float32Array(analyser.fftSize);
   (function tick(){
@@ -128,12 +164,72 @@ function meterLoop(){
     var s = 0; for (var i = 0; i < buf.length; i++) { s += buf[i] * buf[i]; }
     var rms = Math.sqrt(s / buf.length);
     $('bar').style.width = Math.min(100, Math.round(rms * 400)) + '%';
+    if (running && rec) {
+      var now = Date.now();
+      if (rms > TH) {
+        voicedFrames++; lastVoice = now;
+        if (voicedFrames >= 10 && !heardSpeech) { heardSpeech = true; setStatus('Hearing speech...'); }
+      } else if (heardSpeech && now - lastVoice > PAUSE_MS) {
+        setStatus('Translating...'); endSegment(true);
+      } else if (!heardSpeech && now - segStart > 30000) {
+        endSegment(false);
+      }
+    }
     raf = requestAnimationFrame(tick);
   })();
 }
+
+function blobToBase64(blob){
+  return new Promise(function(res, rej){
+    var fr = new FileReader();
+    fr.onload = function(){ res(String(fr.result).split(',')[1] || ''); };
+    fr.onerror = function(){ rej(fr.error); };
+    fr.readAsDataURL(blob);
+  });
+}
+function extractText(j){
+  if (j && typeof j.output_text === 'string') return j.output_text;
+  var parts = [];
+  ((j && j.steps) || []).forEach(function(s){
+    (s.content || []).forEach(function(c){ if (c.type === 'text' && c.text) parts.push(c.text); });
+  });
+  return parts.join('\n');
+}
+async function callGemini(body){
+  var r = await fetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': getKey() }, body: JSON.stringify(body) });
+  var t = await r.text(); var j = null; try { j = JSON.parse(t); } catch(e) {}
+  if (!r.ok) throw new Error('ERROR ' + r.status + ': ' + t.slice(0, 300));
+  return extractText(j).trim();
+}
+function enqueue(blob, type){
+  queue = queue.then(function(){ return processBlob(blob, type); }).catch(function(e){ setStatus(e.message); });
+}
+async function processBlob(blob, type){
+  if (!getKey()) { setStatus('No API key saved.'); return; }
+  var b64 = await blobToBase64(blob);
+  var heard = await callGemini({
+    model: 'gemini-3.5-transcribe',
+    input: [ { type: 'audio', data: b64, mime_type: type } ],
+    generation_config: { transcription_config: { language_codes: ['en-US', 'th-TH'], mode: 'smart' } }
+  });
+  if (!heard) { setStatus(running ? 'Listening.' : 'Stopped.'); return; }
+  var isThai = /[\u0E00-\u0E7F]/.test(heard);
+  var out = await callGemini({ model: 'gemini-3.5-flash-lite', system_instruction: isThai ? RULES_EN : RULES_TH, input: heard });
+  if (!running) return;
+  addTurn(isThai ? 'partner' : 'you', heard, out);
+  setStatus('Listening.');
+}
+function addTurn(who, heard, out){ turns.unshift({ who: who, heard: heard, out: out }); if (turns.length > 6) turns.pop(); renderCaptions(); }
+function renderCaptions(){
+  if (!turns.length) { $('captions').textContent = 'Captions will appear here.'; return; }
+  $('captions').textContent = turns.map(function(t){
+    return t.who === 'you' ? ('YOU: ' + t.heard + '\nTHAI: ' + t.out) : ('PARTNER: ' + t.heard + '\nENGLISH: ' + t.out);
+  }).join('\n\n');
+}
+
 async function lockScreen(){
   try { if ('wakeLock' in navigator) { wakeLock = await navigator.wakeLock.request('screen'); } }
-  catch(e) { $('status').textContent = 'Screen-awake not available: ' + e.message; }
+  catch(e) { setStatus('Screen-awake not available: ' + e.message); }
 }
 document.addEventListener('visibilitychange', function(){ if (running && document.visibilityState === 'visible') { lockScreen(); } });
 
@@ -141,15 +237,17 @@ $('startBtn').onclick = async function(){
   var btn = this;
   if (!running) {
     ensureCtx();
-    try { await openMic(); } catch(e) { $('status').textContent = 'Mic error: ' + e.message; return; }
+    try { await openMic(); } catch(e) { setStatus('Mic error: ' + e.message); return; }
     await lockScreen();
-    running = true; btn.textContent = 'Stop'; btn.classList.add('stop');
-    $('status').textContent = 'Listening. Talk and watch the green bar.';
+    running = true; startRecorder();
+    btn.textContent = 'Stop'; btn.classList.add('stop');
+    setStatus('Listening.');
   } else {
-    running = false; closeMic();
+    running = false; stopRecorderSilently(); closeMic();
     if (wakeLock) { try { await wakeLock.release(); } catch(e) {} wakeLock = null; }
+    turns = []; renderCaptions();
     btn.textContent = 'Start'; btn.classList.remove('stop');
-    $('status').textContent = 'Stopped.';
+    setStatus('Stopped.');
   }
 };
 
