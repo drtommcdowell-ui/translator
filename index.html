@@ -15,6 +15,7 @@ button{font-size:20px;padding:12px;border-radius:10px;border:0;background:#1a73e
 .row button.on{background:#1a73e8;color:#fff}
 .small{font-size:16px;color:#555}
 #status{font-size:18px;color:#1a237e;font-weight:bold}
+#debug{font-size:15px;color:#b71c1c;white-space:pre-wrap;min-height:20px}
 #meter{height:14px;background:#eee;border-radius:7px;overflow:hidden;margin:6px 0}
 #bar{height:100%;width:0;background:#2e7d32}
 #captions{border:1px solid #ccc;border-radius:10px;min-height:160px;padding:10px;margin:8px 0;white-space:pre-wrap;font-size:22px}
@@ -27,6 +28,7 @@ details{margin-top:14px}
 <body>
 <h1>Translator</h1>
 <div id="status">Ready. Press Start.</div>
+<div id="debug"></div>
 <button id="startBtn" class="big">Start</button>
 <div id="meter"><div id="bar"></div></div>
 <div class="small" id="micName">Mic: not started</div>
@@ -52,13 +54,16 @@ details{margin-top:14px}
 <div id="keyBox"><p class="small">Paste your Gemini API key:</p><input id="keyInput" type="password" autocomplete="off"><button id="saveKey" style="margin-top:8px">Save key</button></div>
 <div id="keySaved" class="hide"><p class="small">Key saved on this device.</p><button id="changeKey" style="background:#777">Change key</button></div>
 </details>
-<p class="small">Version: file 5</p>
+<p class="small">Version: file 6</p>
 
 <script>
 var $ = function(id){ return document.getElementById(id); };
 function load(k,d){ try { var v = localStorage.getItem(k); return v === null ? d : v; } catch(e) { return d; } }
 function save(k,v){ try { localStorage.setItem(k,v); } catch(e) {} }
 function setStatus(t){ $('status').textContent = t; }
+function dbg(t){ $('debug').textContent = t; }
+window.addEventListener('error', function(e){ dbg('Page error: ' + e.message); });
+window.addEventListener('unhandledrejection', function(e){ dbg('Page error: ' + (e.reason && e.reason.message ? e.reason.message : e.reason)); });
 var S = { mic: load('micChoice','phone'), partner: load('partner','female') };
 
 var RULES_TH = "You are a live interpreter. Tom is a man who speaks English. Translate each English message from Tom into natural, friendly, polite everyday Central Thai.\n\nRules:\n1. Tom is male. Always use male forms: ผม for I/me, and end each reply with ครับ or นะครับ. Never use ฉัน, ดิฉัน, ค่ะ, คะ or นะคะ.\n2. This applies even when Tom talks about or quotes a woman. Tom is still the speaker, so the reply still ends with ครับ.\n3. Friendly and polite everyday Thai. No slang, no crude words, no royal or official vocabulary.\n4. Translate questions and requests. Never answer them and never add anything.\n5. Output only the Thai translation: no English, no romanization, no notes, no quotation marks.\n6. Keep names, numbers and places exactly as said.";
@@ -152,7 +157,9 @@ function endSegment(send){
   r.onstop = function(){
     if (send && had) {
       var type = (r.mimeType || 'audio/webm').split(';')[0];
-      enqueueAudio(new Blob(r._chunks, { type: type }), type);
+      var blob = new Blob(r._chunks, { type: type });
+      dbg('Sending ' + Math.round(blob.size / 1024) + ' KB of audio');
+      enqueueAudio(blob, type);
     }
   };
   try { r.stop(); } catch(e) {}
@@ -172,6 +179,7 @@ async function checkPartial(){
     if (rec !== r) return;
     var type = (r.mimeType || 'audio/webm').split(';')[0];
     var text = await transcribe(new Blob(r._chunks.slice(), { type: type }), type);
+    dbg('Ten-ten check heard: "' + text + '"');
     if (rec !== r || !running) return;
     if (END_RE.test(text)) {
       rec = null; r.onstop = null; try { r.stop(); } catch(e) {}
@@ -180,6 +188,7 @@ async function checkPartial(){
       enqueueText(text.replace(END_RE, '').trim());
     }
   } catch(e) {
+    dbg('Ten-ten check error: ' + e.message);
   } finally {
     checking = false;
   }
@@ -284,17 +293,19 @@ function enqueueAudio(blob, type){
   queue = queue.then(async function(){
     if (!getKey()) { setStatus('No API key saved.'); return; }
     var t = await transcribe(blob, type);
+    dbg('Heard: "' + t + '"');
     await processText(t.replace(END_RE, '').trim());
-  }).catch(function(e){ setStatus(e.message); });
+  }).catch(function(e){ setStatus('Stopped on an error'); dbg(e.message); });
 }
 function enqueueText(text){
-  queue = queue.then(function(){ return processText(text); }).catch(function(e){ setStatus(e.message); });
+  queue = queue.then(function(){ return processText(text); }).catch(function(e){ setStatus('Stopped on an error'); dbg(e.message); });
 }
 async function processText(heard){
-  if (!heard) { setStatus(running ? 'Listening.' : 'Stopped.'); return; }
+  if (!heard) { setStatus(running ? 'Listening. (nothing was heard)' : 'Stopped.'); return; }
   var isThai = /[\u0E00-\u0E7F]/.test(heard);
   var out = await callGemini({ model: 'gemini-3.5-flash-lite', system_instruction: isThai ? RULES_EN : RULES_TH, input: heard });
-  if (!running || !out) return;
+  if (!running) return;
+  if (!out) { setStatus('Listening. (no translation came back)'); return; }
   addTurn(isThai ? 'partner' : 'you', heard, out);
   setStatus('Making the voice...');
   var voice = isThai ? (S.partner === 'male' ? 'Achird' : 'Sulafat') : 'Achird';
@@ -319,7 +330,7 @@ document.addEventListener('visibilitychange', function(){ if (running && documen
 $('startBtn').onclick = async function(){
   var btn = this;
   if (!running) {
-    ensureCtx();
+    ensureCtx(); dbg('');
     try { await openMic(); } catch(e) { setStatus('Mic error: ' + e.message); return; }
     await lockScreen();
     running = true; playing = false; startRecorder();
