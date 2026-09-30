@@ -54,7 +54,7 @@ details{margin-top:14px}
 <div id="keyBox"><p class="small">Paste your Gemini API key:</p><input id="keyInput" type="password" autocomplete="off"><button id="saveKey" style="margin-top:8px">Save key</button></div>
 <div id="keySaved" class="hide"><p class="small">Key saved on this device.</p><button id="changeKey" style="background:#777">Change key</button></div>
 </details>
-<p class="small">Version: file 6</p>
+<p class="small">Version: file 7</p>
 
 <script>
 var $ = function(id){ return document.getElementById(id); };
@@ -69,7 +69,7 @@ var S = { mic: load('micChoice','phone'), partner: load('partner','female') };
 var RULES_TH = "You are a live interpreter. Tom is a man who speaks English. Translate each English message from Tom into natural, friendly, polite everyday Central Thai.\n\nRules:\n1. Tom is male. Always use male forms: ผม for I/me, and end each reply with ครับ or นะครับ. Never use ฉัน, ดิฉัน, ค่ะ, คะ or นะคะ.\n2. This applies even when Tom talks about or quotes a woman. Tom is still the speaker, so the reply still ends with ครับ.\n3. Friendly and polite everyday Thai. No slang, no crude words, no royal or official vocabulary.\n4. Translate questions and requests. Never answer them and never add anything.\n5. Output only the Thai translation: no English, no romanization, no notes, no quotation marks.\n6. Keep names, numbers and places exactly as said.";
 var RULES_EN = "You are a live interpreter. Tom's conversation partner speaks Central Thai to Tom. Translate each Thai message into natural, friendly, polite everyday English.\n\nRules:\n1. Translate questions and requests. Never answer them and never add anything.\n2. Output only the English translation: no Thai, no notes, no quotation marks.\n3. Keep names, numbers and places exactly as said.";
 var API_URL = 'https://generativelanguage.googleapis.com/v1beta/interactions';
-var PAUSE_MS = 4000, CHECK_MS = 700, TH = 0.02;
+var PAUSE_MS = 4000, CHECK_MS = 1000, TH = 0.02;
 var END_RE = /[\s,\.]*(ten[\s\-\.:]*ten|10[\s\-\.:]*10|เท็น\s*เท็น|เทน\s*เทน)[\s\.\!\?,]*$/i;
 
 function paintChoices(){
@@ -104,7 +104,9 @@ $('testRight').onclick = function(){ beep(1); };
 var running = false, stream = null, raf = 0, analyser = null, srcNode = null, wakeLock = null;
 var rec = null, heardSpeech = false, voicedFrames = 0, lastVoice = 0, segStart = 0;
 var queue = Promise.resolve(), turns = [], playing = false, currentSource = null;
-var checking = false, lastCheck = 0;
+var checking = false, lastCheck = 0, checkedPause = false, pendingFinal = 0, callTimes = [];
+function callsLastMinute(){ var n = Date.now(); callTimes = callTimes.filter(function(t){ return n - t < 60000; }); return callTimes.length; }
+function sleep(ms){ return new Promise(function(res){ setTimeout(res, ms); }); }
 
 async function listInputs(){
   var devs = await navigator.mediaDevices.enumerateDevices();
@@ -149,7 +151,7 @@ function startRecorder(){
   r._chunks = [];
   r.ondataavailable = function(e){ if (e.data && e.data.size) r._chunks.push(e.data); };
   r.start();
-  rec = r; heardSpeech = false; voicedFrames = 0; segStart = Date.now(); lastVoice = 0; lastCheck = 0;
+  rec = r; heardSpeech = false; voicedFrames = 0; segStart = Date.now(); lastVoice = 0; lastCheck = 0; checkedPause = false;
 }
 function endSegment(send){
   var r = rec; if (!r) return; rec = null;
@@ -166,34 +168,6 @@ function endSegment(send){
   if (running && !playing) startRecorder();
 }
 
-async function checkPartial(){
-  var r = rec; if (!r) return;
-  checking = true; lastCheck = Date.now();
-  try {
-    await new Promise(function(res){
-      var done = false; var h = function(){ if (!done) { done = true; res(); } };
-      r.addEventListener('dataavailable', h, { once: true });
-      try { r.requestData(); } catch(e) { h(); }
-      setTimeout(h, 400);
-    });
-    if (rec !== r) return;
-    var type = (r.mimeType || 'audio/webm').split(';')[0];
-    var text = await transcribe(new Blob(r._chunks.slice(), { type: type }), type);
-    dbg('Ten-ten check heard: "' + text + '"');
-    if (rec !== r || !running) return;
-    if (END_RE.test(text)) {
-      rec = null; r.onstop = null; try { r.stop(); } catch(e) {}
-      if (running && !playing) startRecorder();
-      setStatus('Translating...');
-      enqueueText(text.replace(END_RE, '').trim());
-    }
-  } catch(e) {
-    dbg('Ten-ten check error: ' + e.message);
-  } finally {
-    checking = false;
-  }
-}
-
 function meterLoop(){
   var buf = new Float32Array(analyser.fftSize);
   (function tick(){
@@ -204,12 +178,10 @@ function meterLoop(){
     if (running && rec && !playing) {
       var now = Date.now();
       if (rms > TH) {
-        voicedFrames++; lastVoice = now;
+        voicedFrames++; lastVoice = now; checkedPause = false;
         if (voicedFrames >= 10 && !heardSpeech) { heardSpeech = true; setStatus('Hearing speech...'); }
       } else if (heardSpeech && now - lastVoice > PAUSE_MS) {
         setStatus('Translating...'); endSegment(true);
-      } else if (heardSpeech && !checking && now - lastVoice > CHECK_MS && now - lastCheck > 1500) {
-        checkPartial();
       } else if (!heardSpeech && now - segStart > 30000) {
         endSegment(false);
       }
@@ -249,13 +221,25 @@ async function postGemini(body){
   return j;
 }
 async function callGemini(body){ return extractText(await postGemini(body)).trim(); }
-async function transcribe(blob, type){
+async function transcribe(blob, type, quick){
   var b64 = await blobToBase64(blob);
-  return callGemini({
+  var body = {
     model: 'gemini-3.5-transcribe',
     input: [ { type: 'audio', data: b64, mime_type: type } ],
     generation_config: { transcription_config: { language_codes: ['en-US', 'th-TH'], mode: 'smart' } }
-  });
+  };
+  for (var tries = 0; ; tries++) {
+    callTimes.push(Date.now());
+    try { return await callGemini(body); }
+    catch(e) {
+      if (quick || tries >= 3 || e.message.indexOf('ERROR 429') !== 0) throw e;
+      var m = /retry in ([\d\.]+)/i.exec(e.message);
+      var wait = m ? Math.ceil(parseFloat(m[1])) + 1 : 15;
+      setStatus('Google busy limit, waiting ' + wait + ' seconds...');
+      await sleep(wait * 1000);
+      setStatus('Translating...');
+    }
+  }
 }
 async function speak(text, voice){
   var j = await postGemini({
@@ -290,19 +274,21 @@ function playAudio(b64, pan){
   });
 }
 function enqueueAudio(blob, type){
+  pendingFinal++;
   queue = queue.then(async function(){
     if (!getKey()) { setStatus('No API key saved.'); return; }
     var t = await transcribe(blob, type);
     dbg('Heard: "' + t + '"');
+    pendingFinal--;
     await processText(t.replace(END_RE, '').trim());
-  }).catch(function(e){ setStatus('Stopped on an error'); dbg(e.message); });
+  }).catch(function(e){ pendingFinal = 0; setStatus('Stopped on an error'); dbg(e.message); });
 }
 function enqueueText(text){
   queue = queue.then(function(){ return processText(text); }).catch(function(e){ setStatus('Stopped on an error'); dbg(e.message); });
 }
 async function processText(heard){
   if (!heard) { setStatus(running ? 'Listening. (nothing was heard)' : 'Stopped.'); return; }
-  var isThai = /[\u0E00-\u0E7F]/.test(heard);
+  var isThai = /[฀-๿]/.test(heard);
   var out = await callGemini({ model: 'gemini-3.5-flash-lite', system_instruction: isThai ? RULES_EN : RULES_TH, input: heard });
   if (!running) return;
   if (!out) { setStatus('Listening. (no translation came back)'); return; }
