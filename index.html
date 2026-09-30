@@ -52,7 +52,7 @@ details{margin-top:14px}
 <div id="keyBox"><p class="small">Paste your Gemini API key:</p><input id="keyInput" type="password" autocomplete="off"><button id="saveKey" style="margin-top:8px">Save key</button></div>
 <div id="keySaved" class="hide"><p class="small">Key saved on this device.</p><button id="changeKey" style="background:#777">Change key</button></div>
 </details>
-<p class="small">Version: file 4</p>
+<p class="small">Version: file 5</p>
 
 <script>
 var $ = function(id){ return document.getElementById(id); };
@@ -64,7 +64,8 @@ var S = { mic: load('micChoice','phone'), partner: load('partner','female') };
 var RULES_TH = "You are a live interpreter. Tom is a man who speaks English. Translate each English message from Tom into natural, friendly, polite everyday Central Thai.\n\nRules:\n1. Tom is male. Always use male forms: ผม for I/me, and end each reply with ครับ or นะครับ. Never use ฉัน, ดิฉัน, ค่ะ, คะ or นะคะ.\n2. This applies even when Tom talks about or quotes a woman. Tom is still the speaker, so the reply still ends with ครับ.\n3. Friendly and polite everyday Thai. No slang, no crude words, no royal or official vocabulary.\n4. Translate questions and requests. Never answer them and never add anything.\n5. Output only the Thai translation: no English, no romanization, no notes, no quotation marks.\n6. Keep names, numbers and places exactly as said.";
 var RULES_EN = "You are a live interpreter. Tom's conversation partner speaks Central Thai to Tom. Translate each Thai message into natural, friendly, polite everyday English.\n\nRules:\n1. Translate questions and requests. Never answer them and never add anything.\n2. Output only the English translation: no Thai, no notes, no quotation marks.\n3. Keep names, numbers and places exactly as said.";
 var API_URL = 'https://generativelanguage.googleapis.com/v1beta/interactions';
-var PAUSE_MS = 4000, TH = 0.02;
+var PAUSE_MS = 4000, CHECK_MS = 700, TH = 0.02;
+var END_RE = /[\s,\.]*(ten[\s\-\.:]*ten|10[\s\-\.:]*10|เท็น\s*เท็น|เทน\s*เทน)[\s\.\!\?,]*$/i;
 
 function paintChoices(){
   $('micEarbud').classList.toggle('on', S.mic === 'earbud');
@@ -98,6 +99,7 @@ $('testRight').onclick = function(){ beep(1); };
 var running = false, stream = null, raf = 0, analyser = null, srcNode = null, wakeLock = null;
 var rec = null, heardSpeech = false, voicedFrames = 0, lastVoice = 0, segStart = 0;
 var queue = Promise.resolve(), turns = [], playing = false, currentSource = null;
+var checking = false, lastCheck = 0;
 
 async function listInputs(){
   var devs = await navigator.mediaDevices.enumerateDevices();
@@ -142,7 +144,7 @@ function startRecorder(){
   r._chunks = [];
   r.ondataavailable = function(e){ if (e.data && e.data.size) r._chunks.push(e.data); };
   r.start();
-  rec = r; heardSpeech = false; voicedFrames = 0; segStart = Date.now(); lastVoice = 0;
+  rec = r; heardSpeech = false; voicedFrames = 0; segStart = Date.now(); lastVoice = 0; lastCheck = 0;
 }
 function endSegment(send){
   var r = rec; if (!r) return; rec = null;
@@ -150,11 +152,37 @@ function endSegment(send){
   r.onstop = function(){
     if (send && had) {
       var type = (r.mimeType || 'audio/webm').split(';')[0];
-      enqueue(new Blob(r._chunks, { type: type }), type);
+      enqueueAudio(new Blob(r._chunks, { type: type }), type);
     }
   };
   try { r.stop(); } catch(e) {}
   if (running && !playing) startRecorder();
+}
+
+async function checkPartial(){
+  var r = rec; if (!r) return;
+  checking = true; lastCheck = Date.now();
+  try {
+    await new Promise(function(res){
+      var done = false; var h = function(){ if (!done) { done = true; res(); } };
+      r.addEventListener('dataavailable', h, { once: true });
+      try { r.requestData(); } catch(e) { h(); }
+      setTimeout(h, 400);
+    });
+    if (rec !== r) return;
+    var type = (r.mimeType || 'audio/webm').split(';')[0];
+    var text = await transcribe(new Blob(r._chunks.slice(), { type: type }), type);
+    if (rec !== r || !running) return;
+    if (END_RE.test(text)) {
+      rec = null; r.onstop = null; try { r.stop(); } catch(e) {}
+      if (running && !playing) startRecorder();
+      setStatus('Translating...');
+      enqueueText(text.replace(END_RE, '').trim());
+    }
+  } catch(e) {
+  } finally {
+    checking = false;
+  }
 }
 
 function meterLoop(){
@@ -171,6 +199,8 @@ function meterLoop(){
         if (voicedFrames >= 10 && !heardSpeech) { heardSpeech = true; setStatus('Hearing speech...'); }
       } else if (heardSpeech && now - lastVoice > PAUSE_MS) {
         setStatus('Translating...'); endSegment(true);
+      } else if (heardSpeech && !checking && now - lastVoice > CHECK_MS && now - lastCheck > 1500) {
+        checkPartial();
       } else if (!heardSpeech && now - segStart > 30000) {
         endSegment(false);
       }
@@ -210,6 +240,14 @@ async function postGemini(body){
   return j;
 }
 async function callGemini(body){ return extractText(await postGemini(body)).trim(); }
+async function transcribe(blob, type){
+  var b64 = await blobToBase64(blob);
+  return callGemini({
+    model: 'gemini-3.5-transcribe',
+    input: [ { type: 'audio', data: b64, mime_type: type } ],
+    generation_config: { transcription_config: { language_codes: ['en-US', 'th-TH'], mode: 'smart' } }
+  });
+}
 async function speak(text, voice){
   var j = await postGemini({
     model: 'gemini-3.8-flash-tts',
@@ -242,17 +280,17 @@ function playAudio(b64, pan){
     }, function(){ setStatus('Could not play the audio.'); resolve(); });
   });
 }
-function enqueue(blob, type){
-  queue = queue.then(function(){ return processBlob(blob, type); }).catch(function(e){ setStatus(e.message); });
+function enqueueAudio(blob, type){
+  queue = queue.then(async function(){
+    if (!getKey()) { setStatus('No API key saved.'); return; }
+    var t = await transcribe(blob, type);
+    await processText(t.replace(END_RE, '').trim());
+  }).catch(function(e){ setStatus(e.message); });
 }
-async function processBlob(blob, type){
-  if (!getKey()) { setStatus('No API key saved.'); return; }
-  var b64 = await blobToBase64(blob);
-  var heard = await callGemini({
-    model: 'gemini-3.5-transcribe',
-    input: [ { type: 'audio', data: b64, mime_type: type } ],
-    generation_config: { transcription_config: { language_codes: ['en-US', 'th-TH'], mode: 'smart' } }
-  });
+function enqueueText(text){
+  queue = queue.then(function(){ return processText(text); }).catch(function(e){ setStatus(e.message); });
+}
+async function processText(heard){
   if (!heard) { setStatus(running ? 'Listening.' : 'Stopped.'); return; }
   var isThai = /[\u0E00-\u0E7F]/.test(heard);
   var out = await callGemini({ model: 'gemini-3.5-flash-lite', system_instruction: isThai ? RULES_EN : RULES_TH, input: heard });
@@ -288,25 +326,3 @@ $('startBtn').onclick = async function(){
     btn.textContent = 'Stop'; btn.classList.add('stop');
     setStatus('Listening.');
   } else {
-    running = false; stopRecorderSilently();
-    if (currentSource) { try { currentSource.stop(); } catch(e) {} currentSource = null; }
-    playing = false; closeMic();
-    if (wakeLock) { try { await wakeLock.release(); } catch(e) {} wakeLock = null; }
-    turns = []; renderCaptions();
-    btn.textContent = 'Start'; btn.classList.remove('stop');
-    setStatus('Stopped.');
-  }
-};
-
-$('listMics').onclick = async function(){
-  try {
-    var tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
-    var inputs = await listInputs(); tmp.getTracks().forEach(function(t){ t.stop(); });
-    $('diag').textContent = inputs.map(function(d, i){ return (i + 1) + '. ' + (d.label || '(no name)') + '  [' + d.deviceId.slice(0, 8) + ']'; }).join('\n') || 'No microphones found.';
-  } catch(e) { $('diag').textContent = 'Error: ' + e.message; }
-};
-
-paintChoices(); showKeyState();
-</script>
-</body>
-</html>
