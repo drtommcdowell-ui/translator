@@ -52,7 +52,7 @@ details{margin-top:14px}
 <div id="keyBox"><p class="small">Paste your Gemini API key:</p><input id="keyInput" type="password" autocomplete="off"><button id="saveKey" style="margin-top:8px">Save key</button></div>
 <div id="keySaved" class="hide"><p class="small">Key saved on this device.</p><button id="changeKey" style="background:#777">Change key</button></div>
 </details>
-<p class="small">Version: file 3</p>
+<p class="small">Version: file 4</p>
 
 <script>
 var $ = function(id){ return document.getElementById(id); };
@@ -97,7 +97,7 @@ $('testRight').onclick = function(){ beep(1); };
 
 var running = false, stream = null, raf = 0, analyser = null, srcNode = null, wakeLock = null;
 var rec = null, heardSpeech = false, voicedFrames = 0, lastVoice = 0, segStart = 0;
-var queue = Promise.resolve(), turns = [];
+var queue = Promise.resolve(), turns = [], playing = false, currentSource = null;
 
 async function listInputs(){
   var devs = await navigator.mediaDevices.enumerateDevices();
@@ -133,7 +133,7 @@ function closeMic(){
 function stopRecorderSilently(){ if (rec) { var r = rec; rec = null; r.onstop = null; try { r.stop(); } catch(e) {} } }
 async function restartMic(){
   stopRecorderSilently(); closeMic();
-  try { await openMic(); if (running) startRecorder(); } catch(e) { setStatus('Mic error: ' + e.message); }
+  try { await openMic(); if (running && !playing) startRecorder(); } catch(e) { setStatus('Mic error: ' + e.message); }
 }
 
 function startRecorder(){
@@ -154,7 +154,7 @@ function endSegment(send){
     }
   };
   try { r.stop(); } catch(e) {}
-  if (running) startRecorder();
+  if (running && !playing) startRecorder();
 }
 
 function meterLoop(){
@@ -164,7 +164,7 @@ function meterLoop(){
     var s = 0; for (var i = 0; i < buf.length; i++) { s += buf[i] * buf[i]; }
     var rms = Math.sqrt(s / buf.length);
     $('bar').style.width = Math.min(100, Math.round(rms * 400)) + '%';
-    if (running && rec) {
+    if (running && rec && !playing) {
       var now = Date.now();
       if (rms > TH) {
         voicedFrames++; lastVoice = now;
@@ -195,11 +195,52 @@ function extractText(j){
   });
   return parts.join('\n');
 }
-async function callGemini(body){
+function extractAudio(j){
+  var d = '';
+  ((j && j.steps) || []).forEach(function(s){
+    (s.content || []).forEach(function(c){ if (c.type === 'audio' && c.data) d = c.data; });
+  });
+  if (!d && j && j.output_audio && j.output_audio.data) d = j.output_audio.data;
+  return d;
+}
+async function postGemini(body){
   var r = await fetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': getKey() }, body: JSON.stringify(body) });
   var t = await r.text(); var j = null; try { j = JSON.parse(t); } catch(e) {}
   if (!r.ok) throw new Error('ERROR ' + r.status + ': ' + t.slice(0, 300));
-  return extractText(j).trim();
+  return j;
+}
+async function callGemini(body){ return extractText(await postGemini(body)).trim(); }
+async function speak(text, voice){
+  var j = await postGemini({
+    model: 'gemini-3.8-flash-tts',
+    input: [ { type: 'user_input', content: [ { type: 'text', text: text, annotations: [ { type: 'speech_metadata', style: 'friendly and polite' } ] } ] } ],
+    response_format: { type: 'audio' },
+    generation_config: { speech_config: [ { voice: voice } ] }
+  });
+  var b64 = extractAudio(j);
+  if (!b64) throw new Error('No audio returned.');
+  return b64;
+}
+function playAudio(b64, pan){
+  return new Promise(function(resolve){
+    var c = ensureCtx();
+    var bin = atob(b64); var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }
+    c.decodeAudioData(bytes.buffer, function(buffer){
+      if (!running) { resolve(); return; }
+      stopRecorderSilently(); playing = true; setStatus('Speaking...');
+      var src = c.createBufferSource(); src.buffer = buffer;
+      var p = c.createStereoPanner(); p.pan.value = pan;
+      src.connect(p); p.connect(c.destination);
+      currentSource = src;
+      src.onended = function(){
+        currentSource = null; playing = false;
+        if (running && stream && !rec) { startRecorder(); setStatus('Listening.'); }
+        resolve();
+      };
+      src.start();
+    }, function(){ setStatus('Could not play the audio.'); resolve(); });
+  });
 }
 function enqueue(blob, type){
   queue = queue.then(function(){ return processBlob(blob, type); }).catch(function(e){ setStatus(e.message); });
@@ -215,9 +256,13 @@ async function processBlob(blob, type){
   if (!heard) { setStatus(running ? 'Listening.' : 'Stopped.'); return; }
   var isThai = /[\u0E00-\u0E7F]/.test(heard);
   var out = await callGemini({ model: 'gemini-3.5-flash-lite', system_instruction: isThai ? RULES_EN : RULES_TH, input: heard });
-  if (!running) return;
+  if (!running || !out) return;
   addTurn(isThai ? 'partner' : 'you', heard, out);
-  setStatus('Listening.');
+  setStatus('Making the voice...');
+  var voice = isThai ? (S.partner === 'male' ? 'Achird' : 'Sulafat') : 'Achird';
+  var pan = isThai ? 1 : -1;
+  var audio = await speak(out, voice);
+  await playAudio(audio, pan);
 }
 function addTurn(who, heard, out){ turns.unshift({ who: who, heard: heard, out: out }); if (turns.length > 6) turns.pop(); renderCaptions(); }
 function renderCaptions(){
@@ -239,11 +284,13 @@ $('startBtn').onclick = async function(){
     ensureCtx();
     try { await openMic(); } catch(e) { setStatus('Mic error: ' + e.message); return; }
     await lockScreen();
-    running = true; startRecorder();
+    running = true; playing = false; startRecorder();
     btn.textContent = 'Stop'; btn.classList.add('stop');
     setStatus('Listening.');
   } else {
-    running = false; stopRecorderSilently(); closeMic();
+    running = false; stopRecorderSilently();
+    if (currentSource) { try { currentSource.stop(); } catch(e) {} currentSource = null; }
+    playing = false; closeMic();
     if (wakeLock) { try { await wakeLock.release(); } catch(e) {} wakeLock = null; }
     turns = []; renderCaptions();
     btn.textContent = 'Start'; btn.classList.remove('stop');
