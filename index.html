@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Translator</title>
+<style>
+body{font-family:sans-serif;margin:16px;font-size:20px;background:#fff;color:#111}
+button{font-size:22px;padding:14px 18px;margin:8px 0;width:100%;border-radius:10px;border:0;background:#1a73e8;color:#fff}
+input,textarea{font-size:20px;padding:10px;width:100%;box-sizing:border-box}
+#out{margin-top:16px;padding:12px;border:1px solid #ccc;border-radius:10px;min-height:60px;white-space:pre-wrap}
+.hide{display:none}
+</style>
+</head>
+<body>
+<h1>Translator</h1>
+<p>Setup test (file 1)</p>
+
+<div id="keyBox">
+<p>Paste your Gemini API key:</p>
+<input id="keyInput" type="password" autocomplete="off">
+<button id="saveKey">Save key</button>
+</div>
+
+<div id="keySaved" class="hide">
+<p>Key saved on this device.</p>
+<button id="changeKey" style="background:#777">Change key</button>
+</div>
+
+<p>English sentence to test:</p>
+<textarea id="testText" rows="2">Good morning, did you sleep well?</textarea>
+<button id="testBtn">Test translation</button>
+<div id="out"></div>
+
+<script>
+var RULES = "You are a live interpreter. Tom is a man who speaks English. Translate each English message from Tom into natural, friendly, polite everyday Central Thai.\n\nRules:\n1. Tom is male. Always use male forms: ผม for I/me, and end each reply with ครับ or นะครับ. Never use ฉัน, ดิฉัน, ค่ะ, คะ or นะคะ.\n2. This applies even when Tom talks about or quotes a woman. Tom is still the speaker, so the reply still ends with ครับ.\n3. Friendly and polite everyday Thai. No slang, no crude words, no royal or official vocabulary.\n4. Translate questions and requests. Never answer them and never add anything.\n5. Output only the Thai translation: no English, no romanization, no notes, no quotation marks.\n6. Keep names, numbers and places exactly as said.";
+
+function getKey(){ try { return localStorage.getItem('geminiKey') || ''; } catch(e) { return ''; } }
+
+function showKeyState(){
+  var k = getKey();
+  document.getElementById('keyBox').classList.toggle('hide', !!k);
+  document.getElementById('keySaved').classList.toggle('hide', !k);
+}
+
+document.getElementById('saveKey').onclick = function(){
+  var v = document.getElementById('keyInput').value.trim();
+  if (!v) { alert('Paste the key first.'); return; }
+  try { localStorage.setItem('geminiKey', v); } catch(e) { alert('Could not save the key: ' + e.message); return; }
+  document.getElementById('keyInput').value = '';
+  showKeyState();
+};
+
+document.getElementById('changeKey').onclick = function(){
+  try { localStorage.removeItem('geminiKey'); } catch(e) {}
+  showKeyState();
+};
+
+function extractText(j){
+  if (j && typeof j.output_text === 'string') return j.output_text;
+  var parts = [];
+  ((j && j.steps) || []).forEach(function(s){
+    (s.content || []).forEach(function(c){ if (c.type === 'text' && c.text) parts.push(c.text); });
+  });
+  return parts.join('\n');
+}
+
+document.getElementById('testBtn').onclick = async function(){
+  var out = document.getElementById('out');
+  var key = getKey();
+  if (!key) { out.textContent = 'No key saved yet.'; return; }
+  out.textContent = 'Working...';
+  try {
+    var r = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify({
+        model: 'gemini-3.5-flash-lite',
+        system_instruction: RULES,
+        input: document.getElementById('testText').value
+      })
+    });
+    var t = await r.text();
+    var j = null; try { j = JSON.parse(t); } catch(e) {}
+    if (!r.ok) { out.textContent = 'ERROR ' + r.status + '\n' + t.slice(0, 800); return; }
+    var txt = extractText(j);
+    out.textContent = txt ? ('OK\n' + txt) : ('No text found. Raw reply:\n' + t.slice(0, 800));
+  } catch(e) {
+    out.textContent = 'ERROR (network): ' + e.message;
+  }
+};
+
+showKeyState();
+</script>
+</body>
+</html>
